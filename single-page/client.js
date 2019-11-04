@@ -55,6 +55,17 @@ export async function main() {
   window.addEventListener('unload', () => sig('leave', {}, true));
 }
 
+export async function startRecord() {
+  
+  let { status } = await sig('start-record');
+  console.log("startRecord: ", status)
+}
+
+export async function stopRecord() {
+  let { status } = await sig('stop-record');
+  console.log("stopRecord: ", status)
+}
+
 //
 // meeting control actions
 //

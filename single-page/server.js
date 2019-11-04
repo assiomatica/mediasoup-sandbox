@@ -5,6 +5,13 @@ const express = require('express');
 const https = require('https');
 const fs = require('fs');
 
+const {
+  getPort,
+  releasePort
+} = require('./port');
+const FFmpeg = require('./ffmpeg');
+
+
 const expressApp = express();
 let httpsServer;
 
@@ -182,6 +189,89 @@ async function startMediasoup() {
   return { worker, router, audioLevelObserver };
 }
 
+const publishProducerRtpStream = async (peer, producer, ffmpegRtpCapabilities) => {
+  log('============================= publishProducerRtpStream()');
+
+  // Create the mediasoup RTP Transport used to send media to the GStreamer process
+  const rtpTransportConfig =
+  {
+    listenIp: '127.0.0.1',
+    rtcpMux: true,
+    comedia: false 
+  };
+
+  /*
+  const rtpTransport = await createTransport('plain', router, rtpTransportConfig);
+
+  console.log('createTransport() [type:%s. options:%o]', transportType, options);
+
+  switch (transportType) {
+    case 'webRtc':
+      return await router.createWebRtcTransport(config.webRtcTransport); 
+    case 'plain':
+      return await router.createPlainRtpTransport(config.plainRtpTransport);
+  }
+
+  let rtpTransport = await createWebRtcTransport({ peerId, direction });
+    roomState.transports[rtpTransport.id] = rtpTransport;
+
+  */
+  const direction = 'recv'
+ let rtpTransport = await createWebRtcTransport({ peer, direction });
+ 
+  // Set the receiver RTP ports
+  const remoteRtpPort = await getPort();
+  roomState.peers[peer].remotePorts.push(remoteRtpPort);
+
+  let remoteRtcpPort;
+  // If rtpTransport rtcpMux is false also set the receiver RTCP ports
+  if (!rtpTransportConfig.rtcpMux) {
+    remoteRtcpPort = await getPort();
+    roomState.peers[peer].remotePorts.push(remoteRtcpPort);
+  }
+
+
+  // Connect the mediasoup RTP transport to the ports used by GStreamer
+  await rtpTransport.connect({
+    ip: '127.0.0.1',
+    port: remoteRtpPort,
+    rtcpPort: remoteRtcpPort,
+    dtlsParameters: rtpTransport.dtlsParameters
+  });
+
+  ////////////////////// peer.addTransport(rtpTransport);
+  roomState.transports[rtpTransport.id] = rtpTransport;
+
+  const codecs = [];
+  // Codec passed to the RTP Consumer must match the codec in the Mediasoup router rtpCapabilities
+  const routerCodec = router.rtpCapabilities.codecs.find(
+    codec => codec.kind === producer.kind 
+  );
+  codecs.push(routerCodec);
+
+  const rtpCapabilities = {
+    codecs,
+    rtcpFeedback: []
+  };
+
+  // Start the consumer paused
+  // Once the gstreamer process is ready to consume resume and send a keyframe
+  const rtpConsumer = await rtpTransport.consume({
+    producerId: producer.id,
+    rtpCapabilities,
+    paused: true 
+  });
+
+  //////////////////////////// peer.consumers.push(rtpConsumer);
+  roomState.consumers[rtpConsumer.id] = rtpConsumer;
+  return {
+    remoteRtpPort,
+    remoteRtcpPort,
+    localRtcpPort: rtpTransport.rtcpTuple ? rtpTransport.rtcpTuple.localPort : undefined,
+    rtpCapabilities
+  };
+};
+
 //
 // -- our minimal signaling is just http polling --
 //
@@ -191,6 +281,62 @@ async function startMediasoup() {
 // signaling endpoints. (sendBeacon can't set the Content-Type header)
 //
 expressApp.use(express.json({ type: '*/*' }));
+
+expressApp.post('/signaling/start-record', async (req, res) => {
+  let { peerId } = req.body;
+  try {
+
+    let { peerId } = req.body,
+        now = Date.now();
+    log('start-record', peerId);
+
+    // console.log(roomState.peers[peerId], roomState.producers)
+
+    let recordInfo = {};
+
+  for (const producer of roomState.producers) {
+    recordInfo[producer.kind] = await publishProducerRtpStream(peerId, producer);
+  }
+
+  recordInfo.fileName = Date.now().toString();
+
+  log('=============================================== recordInfo: ', recordInfo);
+
+  roomState.peers[peerId].process = new FFmpeg(recordInfo);
+
+/*
+  peer.process = getProcess(recordInfo);
+
+  setTimeout(async () => {
+    for (const consumer of peer.consumers) {
+      // Sometimes the consumer gets resumed before the GStreamer process has fully started
+      // so wait a couple of seconds
+      await consumer.resume();
+    }
+  }, 1000);
+*/
+    res.send({ status: 'recording' });
+  } catch (e) {
+    console.error(e.message);
+    res.send({ error: e.message });
+  }
+});
+
+expressApp.post('/signaling/stop-record', async (req, res) => {
+  let { peerId } = req.body;
+  try {
+
+    let { peerId } = req.body,
+        now = Date.now();
+    log('stop-record', peerId);
+    
+    console.log(roomState.peers[peerId], roomState.producers)
+    res.send({ status: 'stopped' });
+  } catch (e) {
+    console.error(e.message);
+    res.send({ error: e.message });
+  }
+});
 
 // --> /signaling/sync
 //
@@ -235,7 +381,7 @@ expressApp.post('/signaling/join-as-new-peer', async (req, res) => {
     roomState.peers[peerId] = {
       joinTs: now,
       lastSeenTs: now,
-      media: {}, consumerLayers: {}, stats: {}
+      media: {}, consumerLayers: {}, stats: {}, remotePorts: [], process: null
     };
 
     res.send({ routerRtpCapabilities: router.rtpCapabilities });
